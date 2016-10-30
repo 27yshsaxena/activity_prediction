@@ -1,0 +1,228 @@
+---
+title: 'Practical machine learning: Qualitative recognition of weight lifting exercise'
+author: "Danylo"
+date: "October 30, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message= FALSE, results='hide')
+```
+
+One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use .
+
+Six young health participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E).
+
+```{r}
+trainDataUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testDataUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+```
+
+```{r}
+dataDirectory <- tempdir()
+trainFile <- paste0(dataDirectory, "pml-training.csv")
+testFile <- paste0(dataDirectory, "pml-testing.csv")
+```
+
+The file with training data for this project is available here (https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv)
+and test data here (https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv)
+
+The data was taken from accelerometers on the belt, forearm, arm, and dumbell. Each inertial measurement unit (IMU) has x, y, and z values + euler angles (roll, pitch and yaw). For each time window (1s of data), there are several statistics calculations, like Kurtosis, Variance, etc. The goal of the project is to predict the manner in which they did the exercise. This is the "classe" variable in the training set.
+
+[Read more about dataset](http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises)
+
+
+##Reproducibility
+Required R-libraries
+```{r, echo=TRUE}
+require(caret)
+require(zoo)
+require(kernlab)
+require(LiblineaR)
+require(randomForest)
+require(e1071)
+```
+
+Seed for pseudo-random generator
+```{r, echo=TRUE}
+set.seed(3456)
+```
+
+##Data retrieve and cleanup
+1. Data sets are automatically downloaded and stored in temporary directory for re-use. 
+```{r}
+setInternet2(TRUE)
+downloadIfNotExists <- function(url, local){
+  if (!file.exists(local)){
+    download.file(url = url, destfile = local)
+  }
+}
+```
+
+```{r, echo=TRUE}
+downloadIfNotExists(url = trainDataUrl, local = trainFile)
+downloadIfNotExists(url = testDataUrl, local = testFile)
+```
+
+2. Data is stored in CSV-format. Some values are missing (empty string) or inappropriate ("#DIV/0!"). Those are automatically replaced with ```r NA``` value
+```{r, echo=TRUE}
+readData <- function(fileName){
+  read.csv(fileName, na.strings = c("", "#DIV/0!"))
+}
+```
+
+3. Executing data cleanup.
+
++ Non numeric and participant specific data is removed.
+  
++ Columns with not available values are removed aswell. *See **cleanData** function in markdown source*
+  
++ It is expected to see certain correlation between measurements, since measurements are taken from human body (skeleton). Remove correlating variables form the data set.
+  
++ Prediction parameters are also scaled.
+  
+```{r}
+cleanData <- function(rawData){
+  rawData$new_window <- rawData$new_window == "yes"
+  rawData$cvtd_timestamp <- strptime(rawData$cvtd_timestamp, "%d/%m/%Y %H:%M")
+  
+  labelColumn <- c("classe")
+  knownNonNumericColumns <- c("user_name", "new_window", "cvtd_timestamp")
+  notUsedColumns <- c("X", "num_window", "raw_timestamp_part_1", "raw_timestamp_part_2")
+  
+  allColumns <- colnames(rawData)
+  
+  columnsForFiltering <- setdiff(allColumns, c(knownNonNumericColumns, labelColumn, notUsedColumns))
+  
+  removedColumns <- c() 
+  for (column in columnsForFiltering) {
+    if (sum(is.na(rawData[[column]])) != 0){
+      removedColumns <- c(removedColumns, column)    
+    }
+  }
+  
+  columnsToConvert <- setdiff(columnsForFiltering, removedColumns)
+  for(column in columnsToConvert){
+    rawData[[column]] <- as.numeric(rawData[[column]]) 
+  }
+  
+  usedColumns <- allColumns
+  usedColumns <- setdiff(usedColumns, knownNonNumericColumns)
+  usedColumns <- setdiff(usedColumns, notUsedColumns)
+  usedColumns <- setdiff(usedColumns, removedColumns)
+  
+  rawData[usedColumns]
+}
+```
+
+```{r, echo=TRUE}
+trainingData <- readData(trainFile)
+trainingData <- cleanData(trainingData)
+
+labelColumn <- c("classe")
+
+parameterColumns <- setdiff(
+  colnames(trainingData),
+  labelColumn
+)
+
+corelatedParameters <- findCorrelation(
+  cor(trainingData[parameterColumns]),
+  cutoff = 0.8,
+  names = TRUE,
+  exact = TRUE
+)
+
+keepParameterColumns <- setdiff(parameterColumns, corelatedParameters)
+
+keepColumns <- c(
+  labelColumn,
+  keepParameterColumns  
+)
+
+trainingData <- trainingData[keepColumns]
+dataPreProcess <- preProcess(trainingData[keepParameterColumns], method = c("scale"))
+trainingData <- predict(dataPreProcess, trainingData)
+```
+The following predictors are going to be used for training.
+```{r, results='markup'}
+print(keepParameterColumns)
+```
+
+5. Prepare testing data set using the same cleanup procedure. Keep only columns used in training data set.
+```{r, echo=TRUE}
+testingData <- readData(testFile)
+testingData <- cleanData(testingData)
+testingData <- testingData[intersect(colnames(testingData), keepColumns)]
+testingData <- predict(dataPreProcess, testingData)
+```
+
+##Training classification models
+Speaking in machine learning terms, we should solve classification problem. Separate training and testing data sets are provided. Training data set has labels assigned. It is the case of supervised learning.
+
+There are only 6 participats in the study. The cross-validation procedure can prevent the overfitting problem. Therefore Random forest seems a good candidate for training. Support Vector Machines algorithm will be trained and used for comparison.
+
+Original training data set will be split to training (80%) and validation (20%) parts to compare the models.
+```{r}
+expectedAccuracy <- function(predictorsCount, predictorAccuracy){
+  majority <- as.integer(floor(predictorsCount / 2) + 1)
+  sum(dbinom(majority:predictorsCount, size = predictorsCount, prob = predictorAccuracy))
+}
+```
+Expected out-of-sample error should be low, probably below 5%. Assuming all used clasifiers are independent and accurancy of each is only 70%, majority vote would yield  ```r round(expectedAccuracy(length(keepParameterColumns), .7) * 100, 2)```% model accuracy.
+
+```{r, echo=TRUE}
+trainRows <- createDataPartition(trainingData$classe, p = .8, list = FALSE)
+training <- trainingData[trainRows, ]
+validation <- trainingData[-trainRows, ]
+```
+
+Train classification models to predict exercise quality (*classe*) using all other variables in data set.  
+```{r, echo=TRUE}
+modelRf <- randomForest(classe ~. , data = training, method = "class")
+modelSvm <- svm(classe ~. , data = training, cachesize = 100)
+```
+
+Evaluate trained models: get Confusion matrix and accuracy for each. 
+```{r, echo=TRUE}
+resultRf <- predict(modelRf, validation)
+resultSvm <- predict(modelSvm, validation)
+
+confusionMatrixRf <- confusionMatrix(resultRf, validation$classe)
+confusionMatrixSvm <- confusionMatrix(resultSvm, validation$classe)
+
+accuracyRf <- confusionMatrixRf$overall["Accuracy"]
+accuracySvm <- confusionMatrixSvm$overall["Accuracy"]
+```
+
+**Results for Random forest model**
+```{r, results='markup'}
+print(confusionMatrixRf)
+```
+
+**Results for model trained with Support Vector Machines**
+```{r, results='markup'}
+print(confusionMatrixSvm)
+```
+
+Choose the model with better accuracy and run on test input.
+```{r}
+finalModel <- (if (accuracyRf > accuracySvm) modelRf else modelSvm)
+quizResult <- predict(finalModel, testingData)
+```
+
+##Test results
+The predictions for test data are the following.  
+```{r, results='markup'}
+print(quizResult)
+```
+
+Results has been submitted to Prediction Quiz and got 20/20 result. 
+
+## References
+1. [Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.](http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises)
+1. [Description of dataset used in this project in UC Irvine Machine Learning Repository](https://archive.ics.uci.edu/ml/datasets/Weight+Lifting+Exercises+monitored+with+Inertial+Measurement+Units#)
+1. [Article about SVM](https://www.r-bloggers.com/the-5th-tribe-support-vector-machines-and-caret/)
+1. [Quide for tuning SVM](https://www.csie.ntu.edu.tw/~cjlin/papers/guide/guide.pdf)
+1. [SVM on Wikipedia](https://en.wikipedia.org/wiki/Support_vector_machine)
+
